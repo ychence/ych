@@ -5,6 +5,7 @@ from auth import get_current_user_id
 from database import cosmos_db
 from storage import blob_storage
 from utils import validate_file_type, validate_file_size, generate_thumbnail
+from media_helpers import fetch_and_verify_media_ownership, extract_thumbnail_blob_identifier
 from datetime import datetime
 import uuid
 import json
@@ -173,21 +174,8 @@ async def get_media_by_id(
     Retrieve details of a specific media file
     """
     try:
-        media = cosmos_db.get_media_by_id(media_id, user_id)
-
-        if not media:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Media not found"
-            )
-
-        # Verify ownership
-        if media["userId"] != user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You don't have permission to access this media",
-            )
-
-        return MediaResponse(**media)
+        media_document = fetch_and_verify_media_ownership(media_id, user_id)
+        return MediaResponse(**media_document)
 
     except HTTPException:
         raise
@@ -209,32 +197,20 @@ async def update_media_metadata(
     Update description and tags of a media file
     """
     try:
-        # Get existing media
-        media = cosmos_db.get_media_by_id(media_id, user_id)
+        # Verify media exists and user has ownership
+        media_document = fetch_and_verify_media_ownership(media_id, user_id)
 
-        if not media:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Media not found"
-            )
-
-        # Verify ownership
-        if media["userId"] != user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You don't have permission to update this media",
-            )
-
-        # Prepare updates
-        updates = {"updatedAt": datetime.utcnow().isoformat()}
+        # Prepare updates with timestamp
+        metadata_updates = {"updatedAt": datetime.utcnow().isoformat()}
 
         if update_data.description is not None:
-            updates["description"] = update_data.description
+            metadata_updates["description"] = update_data.description
 
         if update_data.tags is not None:
-            updates["tags"] = update_data.tags
+            metadata_updates["tags"] = update_data.tags
 
-        # Update in database
-        updated_media = cosmos_db.update_media(media_id, user_id, updates)
+        # Apply updates to database
+        updated_media = cosmos_db.update_media(media_id, user_id, metadata_updates)
 
         return MediaResponse(**updated_media)
 
@@ -261,37 +237,21 @@ async def delete_media(
     Delete a media file and its metadata
     """
     try:
-        # Get existing media
-        media = cosmos_db.get_media_by_id(media_id, user_id)
+        # Verify media exists and user has ownership
+        media_document = fetch_and_verify_media_ownership(media_id, user_id)
 
-        if not media:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Media not found"
-            )
+        # Remove primary file from blob storage
+        blob_storage.delete_file(media_document["fileName"])
 
-        # Verify ownership
-        if media["userId"] != user_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You don't have permission to delete this media",
-            )
-
-        # Delete from blob storage
-        blob_storage.delete_file(media["fileName"])
-
-        # Delete thumbnail if exists
-        if media.get("thumbnailUrl"):
-            # Extract blob name from thumbnail URL
+        # Remove thumbnail if present
+        thumbnail_blob_id = extract_thumbnail_blob_identifier(media_document)
+        if thumbnail_blob_id:
             try:
-                thumbnail_blob_name = media["fileName"].replace(
-                    media["originalFileName"].split("/")[-1],
-                    f"thumb_{media['originalFileName'].split('/')[-1]}",
-                )
-                blob_storage.delete_file(thumbnail_blob_name)
+                blob_storage.delete_file(thumbnail_blob_id)
             except Exception as e:
-                logger.warning(f"Failed to delete thumbnail: {e}")
+                logger.warning(f"Thumbnail deletion failed: {e}")
 
-        # Delete from database
+        # Remove metadata from database
         cosmos_db.delete_media(media_id, user_id)
 
         return None
